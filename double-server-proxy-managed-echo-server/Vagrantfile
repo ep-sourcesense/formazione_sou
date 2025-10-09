@@ -1,0 +1,114 @@
+Vagrant.configure("2") do |config|
+
+
+  # Script di provisioning comune per vm1 e vm2 (installazione Nginx + pagina personalizzata + Docker + echo-server)
+  install_nginx_docker_echo = <<-SHELL
+    apt-get update
+    apt-get install -y nginx
+    systemctl enable nginx
+    systemctl start nginx
+
+    # Scrivi una pagina custom con il nome host
+    echo "Risposta da $(hostname)" > /var/www/html/index.html
+
+    # Rimuovi pagina di default per evitare confusione
+    rm -f /var/www/html/index.nginx-debian.html
+
+    # Installa Docker
+    apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io
+    systemctl enable docker
+    systemctl start docker
+
+    # Rimuovi sempre il container echo-server se esiste
+    docker rm -f echo-server 2>/dev/null || true
+
+    # Ferma e rimuovi tutti i container che occupano la porta 3000 (escluso echo-server)
+    for c in $(docker ps -q --filter "publish=3000"); do
+      [ "$(docker inspect --format='{{.Name}}' $c | sed 's|/||')" != "echo-server" ] && docker rm -f "$c" || true
+    done
+
+    # Avvia il container echo-server
+    docker run -d --name echo-server --restart unless-stopped -p 3000:80 ealen/echo-server
+  SHELL
+
+
+  # VM1
+  config.vm.define "vm1" do |vm1|
+    vm1.vm.box = "debian/bullseye64"
+    vm1.vm.hostname = "vm1"
+    vm1.vm.network "private_network", ip: "192.168.56.10"
+    vm1.vm.provision "shell", inline: install_nginx_docker_echo
+  end
+
+
+  # VM2
+  config.vm.define "vm2" do |vm2|
+    vm2.vm.box = "debian/bullseye64"
+    vm2.vm.hostname = "vm2"
+    vm2.vm.network "private_network", ip: "192.168.56.11"
+    vm2.vm.provision "shell", inline: install_nginx_docker_echo
+  end
+
+  # PROXY
+  config.vm.define "proxy" do |proxy|
+    proxy.vm.box = "debian/bullseye64"
+    proxy.vm.hostname = "proxy"
+    proxy.vm.network "private_network", ip: "192.168.56.100"
+
+    proxy.vm.provision "shell", inline: <<-SHELL
+      apt-get update
+      apt-get install -y nginx curl
+      systemctl enable nginx
+      systemctl start nginx
+
+      # Crea lo script di switch proxy
+      cat > /usr/local/bin/switch_proxy.sh << 'EOF'
+#!/bin/bash
+
+# Aggiungi il PATH per cron (evita "command not found" per nginx)
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+VMS=("192.168.56.10" "192.168.56.11")
+NGINX_CONF="/etc/nginx/sites-available/default"
+INDEX_FILE="/tmp/current_vm_index"
+
+if [ -f "$INDEX_FILE" ]; then
+  INDEX=$(cat "$INDEX_FILE")
+else
+  INDEX=0
+fi
+
+NEXT_INDEX=$(( (INDEX + 1) % ${#VMS[@]} ))
+echo $NEXT_INDEX > "$INDEX_FILE"
+
+
+cat > "$NGINX_CONF" << EOCONF
+server {
+  listen 80;
+
+  location / {
+    proxy_pass http://${VMS[$NEXT_INDEX]}:3000;
+  }
+}
+EOCONF
+
+nginx -t && nginx -s reload
+
+echo "Proxy switched to ${VMS[$NEXT_INDEX]}"
+EOF
+
+      chmod +x /usr/local/bin/switch_proxy.sh
+
+      # Esegui subito lo script per configurare nginx la prima volta
+      /usr/local/bin/switch_proxy.sh
+
+      # Setup cron per eseguire lo script ogni minuto e loggare output per debug
+      (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/switch_proxy.sh >> /var/log/switch_proxy.log 2>&1") | crontab -
+    SHELL
+  end
+
+end
